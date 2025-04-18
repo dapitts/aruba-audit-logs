@@ -1,0 +1,475 @@
+#!/bin/bash
+
+# files and directories
+SOURCE_FILE="$(realpath "$0")"
+ROOT_DIR="$(dirname "$SOURCE_FILE")"
+PROJECT_NAME="$(basename "$ROOT_DIR")"
+PROJECT_ETC_DIR="$(realpath "${ROOT_DIR}/../../etc/${PROJECT_NAME}")"
+CREDENTIALS_FILE="$PROJECT_ETC_DIR/credentials.json"
+APP_CONFIG_FILE="$PROJECT_ETC_DIR/app.json"
+ACCESS_TOKEN_FILE="$PROJECT_ETC_DIR/token.json"
+SUPERVISOR_CONFIG_FILE="/etc/supervisor/conf.d/${PROJECT_NAME}.conf"
+SYSLOG_NG_CONFIG_FILE="/etc/syslog-ng/conf.d/${PROJECT_NAME}.conf"
+
+# app requirements and defaults
+PROJECT_NAME_ABBR='aruba-audit-logs'
+MIN_PYTHON_VERSION='3.7'
+APP_USER=nobody
+APP_GROUP=nogroup
+DATA_LISTENER_HOST='127.0.0.1'
+DATA_LISTENER_PORT=30111
+DATA_LISTENER_PROTO='tcp'
+POLLING_INTERVAL_MINS=5
+APP_CONFIG_TEMPLATE="$(cat << EOF
+{
+    "socket_settings": {
+        "data_logger": {
+            "host": "$DATA_LISTENER_HOST",
+            "port": $DATA_LISTENER_PORT,
+            "proto": "$DATA_LISTENER_PROTO"
+        },
+        "app_logger": {
+            "unix_sock_path": "/dev/log",
+            "proto": "udp"
+        }
+    },
+    "data_collection_settings": {
+        "polling_interval_mins": $POLLING_INTERVAL_MINS,
+        "start_time": null
+    },
+    "is_debug": false,
+    "instances": 1
+}
+EOF
+)"
+SUPERVISOR_CONFIG_TEMPLATE="$(cat << EOF
+[program:${PROJECT_NAME_ABBR}]
+# change to project directory, activate virtual environment, execute python program
+command = /bin/bash -c 'export PYTHONDONTWRITEBYTECODE=no && cd $ROOT_DIR && source venv/bin/activate && python main.py'
+# run as specified user
+user=$APP_USER
+# start upon supervisord start
+autostart=true
+# no retries
+startretries=0
+# do not restart process upon unexpected exit from running state
+autorestart=false
+# stop both parent and child processes
+stopasgroup=true
+#log file locations
+stderr_logfile=/var/log/${PROJECT_NAME_ABBR}.err.log
+stdout_logfile=/var/log/${PROJECT_NAME_ABBR}.out.log
+EOF
+)"
+DATA_LISTENER_REMOTE_INFO="Please ensure that a listener is setup to receive data sent by application. Default syslog-ng template: https://github.com/quadrantsec/${PROJECT_NAME}#syslog-ng. Please also ensure that application is configured to send data to the listener. App config: ${APP_CONFIG_FILE}. Note: application cannot currently be configured to send data over TLS; in case of remote listener, connection between appliances should be tunneled. For more information visit: https://github.com/quadrantsec/${PROJECT_NAME}#app-configuration"
+DATA_LISTENER_LOG_DIRS=(
+    '/var/log/remote/offprem' 
+    '/var/log/remote/off-prem'
+)
+for log_dir in ${DATA_LISTENER_LOG_DIRS[@]}; do
+    [[ -d "$log_dir" ]] && DATA_LISTENER_LOG_DIR="$log_dir" && break
+done
+
+################## MAIN FUNCTION ################## 
+
+main() {
+	# check for python3.7+ venv
+	echo ''
+	echo "[0.0] checking for python${MIN_PYTHON_VERSION}+ virtual environment.. "
+	. "$ROOT_DIR/venv/bin/activate" ||
+	{
+		echo "[0.0] failed to detect python virtual environment"
+		# install python3-venv when necessary
+		if ! sudo apt list --installed 2>/dev/null | grep -q 'python3-venv'; then
+			echo "[0.0] installing python3-venv..."
+			sudo apt update &>/dev/null &&
+			sudo apt install -y python3-venv || {
+				echo "[0.0] failed to install python3-venv"
+				return 1
+			}
+		fi
+		echo "[0.0] python3-venv is installed"
+		# install python3.x-venv when necessary
+		python3x_venv="python$(python3 --version | grep -oE '3\.[0-9]+')-venv"
+		if ! sudo apt list --installed 2>/dev/null | grep -q "$python3x_venv"; then
+			echo "[0.0] installing $python3x_venv..."
+			sudo apt update &>/dev/null &&
+			sudo apt install -y "$python3x_venv" || {
+				echo "[0.0] failed to install $python3x_venv"
+				return 1
+			}
+		fi
+		echo "[0.0] $python3x_venv is installed"
+		echo "[0.0] Please remove $ROOT_DIR and allow directory to re-sync. For more information visit: https://github.com/quadrantsec/quadrant-rsync-suite#quadrant-rsync-git"
+		echo "[0.0] Once resynced, please rerun the setup script to continue setup."
+		return 1
+	}
+    echo "[0.0] detected python virtual environment"
+    python_version="$(python --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" &&
+    is_version_ge "$python_version" "$MIN_PYTHON_VERSION" ||
+    {
+        echo "[0.0] failed to meet minimum python version requirement: python${python_version}<${MIN_PYTHON_VERSION}"
+        return 1
+    }
+    echo "[0.0] meets minimum python version requirement: python${python_version}>=${MIN_PYTHON_VERSION}"
+    
+    # check for installation of requirements
+    echo ''
+    echo '[0.1] checking for installation of requirements..'
+    are_requirements_installed "$ROOT_DIR/requirements.txt" ||
+    {
+        echo "[0.1] failed to detect installation of requirements"
+        return 1
+    }
+    echo "[0.1] installation detected: $(cat "$ROOT_DIR/requirements.txt" | tr '\n' ' ')"
+    
+    # check for installation of myrequirements
+    echo ''
+    echo '[0.2] checking for installation of myrequirements..'
+    are_requirements_installed "$ROOT_DIR/myrequirements.txt" ||
+    {
+        echo "[0.2] failed to detect installation of myrequirements. Please ensure that mypip is installed and configured. For instructions visit: https://github.com/quadrantsec/mypip"
+        echo "[0.2] Once done, please remove $ROOT_DIR and allow directory to re-sync. For more information visit: https://github.com/quadrantsec/quadrant-rsync-suite#quadrant-rsync-git"
+        echo "[0.2] Once resynced, please rerun the setup script to continue setup."
+        return 1
+    }
+    echo "[0.2] installation detected: $(cat "$ROOT_DIR/myrequirements.txt" | tr '\n' ' ')"
+    
+    # check for supervisor installation
+    echo ''
+    echo '[0.3] checking for supervisor installation..'
+    supervisor_version="$(sudo supervisorctl version)" ||
+    {
+        echo "[0.3] failed to detect supervisor installation"
+        return 1
+    }
+    echo "[0.3] installation detected: supervisor $supervisor_version"
+
+    # ensure project configuration directory
+    echo ''
+    echo "[1.0] checking for project configuration directory.."
+    if ! [[ -d "$PROJECT_ETC_DIR" ]]; then
+        sudo mkdir -p "$PROJECT_ETC_DIR" ||
+        {
+            echo "[1.0] failed to create project configuration directory"
+            return 1
+        }
+        echo "[1.0] created configuration directory"
+    fi
+    echo "[1.0] detected configuration directory"
+    sudo chown "${APP_USER}:${APP_GROUP}" "$PROJECT_ETC_DIR" || 
+    {
+        echo "[1.0] failed to set configuration directory ownership to ${APP_USER}:${APP_GROUP}"
+        return 1
+    }
+    echo "[1.0] set configuration directory ownership to ${APP_USER}:${APP_GROUP}"
+    ls -lhd "$PROJECT_ETC_DIR"
+
+    # ensure application configuration
+    echo ''
+    echo "[1.1] checking for application configuration.."
+    if ! [[ -f "$APP_CONFIG_FILE" ]]; then
+        echo "$APP_CONFIG_TEMPLATE" | sudo tee "$APP_CONFIG_FILE" 1> /dev/null ||
+        {
+            echo "[1.1] failed to create default application configuration"
+            return 1
+        }
+        echo "[1.1] created default application configuration"
+    fi
+    echo "[1.1] detected application configuration"
+    sudo chown "${APP_USER}:${APP_GROUP}" "$APP_CONFIG_FILE" ||
+    {
+        echo "[1.1] failed to set application configuration ownership to ${APP_USER}:${APP_GROUP}"
+        return 1
+    }
+    echo "[1.1] set application configuration ownership to ${APP_USER}:${APP_GROUP}"
+    ls -lh "$APP_CONFIG_FILE"
+    echo ''
+    promptUser "[1.1] Do you wish to edit $(basename "$APP_CONFIG_FILE")? (y/n) [view: https://github.com/quadrantsec/${PROJECT_NAME}#app-configuration] " &&
+    {
+        sudo vim "$APP_CONFIG_FILE" || echo "[1.1] error occurred when editing file"
+        promptUser '[1.1] Do you wish to continue with setup? (y/n) ' ||
+        {
+            echo ''
+            echo '[1.1] Ok. You may rerun setup at any time'
+            return 1
+        }
+    }
+
+    # ensure supervisor configuration
+    echo ''
+    echo "[2.0] checking for supervisor configuration.."
+    if ! [[ -f "$SUPERVISOR_CONFIG_FILE" ]]; then	
+        echo "$SUPERVISOR_CONFIG_TEMPLATE" | sudo tee "$SUPERVISOR_CONFIG_FILE" 1> /dev/null ||
+        {
+            echo "[2.0] failed to create default supervisor configuration"
+            return 1
+        }
+        echo "[2.0] created default supervisor configuration"
+	sudo supervisorctl reread &&
+	sudo supervisorctl update "$PROJECT_NAME_ABBR" ||
+        {
+            echo "[2.0] failed to load default supervisor configuration"
+            return 1
+        }
+        echo "[2.0] loaded default supervisor configuration"
+    fi
+    echo "[2.0] detected supervisor configuration"
+    ls -lh "$SUPERVISOR_CONFIG_FILE"
+    echo ''
+    promptUser "[2.0] Do you wish to edit supervisor configuration? (y/n) [view: https://github.com/quadrantsec/${PROJECT_NAME}#supervisor] " &&
+    {
+        sudo vim "$SUPERVISOR_CONFIG_FILE" || echo "[2.0] error occurred when editing file"
+        sudo supervisorctl update "$PROJECT_NAME_ABBR" &&
+        echo "[2.0] reloaded supervisor configuration" ||
+        echo "[2.0] failed to reload supervisor configuration"
+        promptUser '[2.0] Do you wish to continue with setup? (y/n) ' ||
+        {
+            echo ''
+            echo '[2.0] Ok. You may rerun setup at any time'
+            return 1
+        }
+    }
+
+    # check for installation of syslog-ng
+    echo ''
+    echo '[3.0] checking for syslog-ng installation..'
+    syslog_ng_license="$(sudo syslog-ng-ctl show-license-info)" &&
+    echo "[3.0] detected syslog-ng installation: $syslog_ng_license" &&
+    {
+        # prompt to create local default configuration (if none exists)
+        if ! [[ -f "$SYSLOG_NG_CONFIG_FILE" ]]; then
+            promptUser "[3.0] Do you wish to locally configure syslog-ng for ${PROJECT_NAME}? (y/n) " &&
+            {
+                [[ "$DATA_LISTENER_LOG_DIR" ]] || {
+                    echo "[3.0] Failed to detect default logfile directories: ${DATA_LISTENER_LOG_DIRS[@]}"
+                    DATA_LISTENER_LOG_DIR="$(enter_directory "[3.0] Please enter destination logfile directory: ")"
+                }
+                gen_syslog_ng_config_template | sudo tee "$SYSLOG_NG_CONFIG_FILE" 1> /dev/null ||
+                {
+                    echo "failed to create default syslog-ng configuration"
+                    return 1
+                }
+                echo "[3.0] created default syslog-ng configuration" &&
+                sudo syslog-ng-ctl reload ||
+                {
+                    echo "[3.0] failed to load default syslog-ng configuration"
+                    return 1
+                }
+                echo  "[3.0] loaded default syslog-ng configuration"
+            } ||
+            {
+                echo "[3.0] $DATA_LISTENER_REMOTE_INFO"
+                promptUser '[3.0] Do you wish to continue with setup? (y/n) ' ||
+                {
+                    echo ''
+                    echo '[3.0] Ok. You may rerun setup at any time'
+                    return 1
+                }
+            }
+        fi
+        # prompt to edit local configuration (if one exists)
+        if [[ -f "$SYSLOG_NG_CONFIG_FILE" ]]; then
+            echo "[3.0] detected local syslog-ng configuration"
+            ls -lh "$SYSLOG_NG_CONFIG_FILE"
+            echo ''
+            promptUser "[3.0] Do you wish to edit syslog-ng configuration? (y/n) [view: https://github.com/quadrantsec/${PROJECT_NAME}#syslog-ng] " &&
+            {
+                sudo vim "$SYSLOG_NG_CONFIG_FILE" || echo "[3.0] error occurred when editing file"
+                sudo syslog-ng-ctl reload &&
+                echo "[3.0] reloaded sylog-ng configuration" ||
+                echo "[3.0] failed to reload syslog-ng configuration"
+                promptUser '[3.0] Do you wish to continue with setup? (y/n) ' ||
+                {
+                    echo ''
+                    echo '[3.0] Ok. You may rerun setup at any time'
+                    return 1
+                }
+            } ||
+            :
+        fi
+    } ||
+    {
+        echo "[3.0] failed to detect syslog-ng installation."
+        echo "[3.0] $DATA_LISTENER_REMOTE_INFO"
+        promptUser '[3.0] Do you wish to continue with setup? (y/n) ' ||
+        {
+            echo ''
+            echo '[3.0] Ok. You may rerun setup at any time'
+            return 1
+        }
+    }
+
+    # ensure application credentials
+    echo ''
+    echo "[1.2] checking for application credentials.."
+    [[ -f "$CREDENTIALS_FILE" ]] ||
+    {
+        echo "[1.2] failed to detect application credentials. Please rename ${PROJECT_NAME_ABBR}-credentials.json received from customer to $(basename "$CREDENTIALS_FILE"), ensure contents are properly formatted, place in $(dirname "$CREDENTIALS_FILE") and rerun setup. Further instructions here: https://github.com/quadrantsec/${PROJECT_NAME}#credentialsjson"
+        return 1
+    }
+    echo "[1.2] detected application credentials"
+    sudo chown "${APP_USER}:${APP_GROUP}" "$CREDENTIALS_FILE" ||
+    {
+        echo "[1.2] failed to set application credentials ownership to ${APP_USER}:${APP_GROUP}"
+        return 1
+    }
+    echo "[1.2] set application credentials ownership to ${APP_USER}:${APP_GROUP}"
+    sudo chmod 0600 "$CREDENTIALS_FILE" ||
+    {
+        echo "[1.2] failed to set application credentials permissions to 0600"
+        return 1
+    }
+    echo "[1.2] set application credentials permissions to 0600"
+
+    # ensure OAuth access token
+    echo ''
+    echo "[1.3] checking for OAuth access token.."
+    [[ -f "$ACCESS_TOKEN_FILE" ]] ||
+    {
+        echo "[1.3] failed to detect OAuth access token. Please take the ${PROJECT_NAME_ABBR}-credentials.json received from the customer and place the token in $(dirname "$ACCESS_TOKEN_FILE") and rerun setup. Further instructions here: https://github.com/quadrantsec/${PROJECT_NAME}#tokenjson"
+        return 1
+    }
+    echo "[1.3] detected OAuth access token"
+    sudo chown "${APP_USER}:${APP_GROUP}" "$ACCESS_TOKEN_FILE" ||
+    {
+        echo "[1.3] failed to set OAuth access token ownership to ${APP_USER}:${APP_GROUP}"
+        return 1
+    }
+    echo "[1.3] set OAuth access token ownership to ${APP_USER}:${APP_GROUP}"
+    sudo chmod 0600 "$ACCESS_TOKEN_FILE" ||
+    {
+        echo "[1.3] failed to set OAuth access token permissions to 0600"
+        return 1
+    }
+    echo "[1.3] set OAuth access token permissions to 0600"
+}
+
+################## SUPPORTING FUNCTIONS ################## 
+
+# Source: https://stackoverflow.com/a/4025065 
+vercomp () {
+    if [[ $1 == $2 ]]
+    then
+        return 0
+    fi
+    local IFS=.
+    local i ver1=($1) ver2=($2)
+    # fill empty fields in ver1 with zeros
+    for ((i=${#ver1[@]}; i<${#ver2[@]}; i++))
+    do
+        ver1[i]=0
+    done
+    for ((i=0; i<${#ver1[@]}; i++))
+    do
+        if [[ -z ${ver2[i]} ]]
+        then
+            # fill empty fields in ver2 with zeros
+            ver2[i]=0
+        fi
+        if ((10#${ver1[i]} > 10#${ver2[i]}))
+        then
+            return 1
+        fi
+        if ((10#${ver1[i]} < 10#${ver2[i]}))
+        then
+            return 2
+        fi
+    done
+    return 0
+}
+
+is_version_ge () {
+    vercomp $1 $2
+    case $? in
+        0) return 0;; #equal
+        1) return 0;; #greater than
+        2) return 1;; #less than
+    esac
+}
+
+are_requirements_installed() {
+    installed_packages="$(pip list)"
+    while read -r line; do
+        read -r package version < <(split "$line" '==' )
+        grep -Eq "^${package}[[:space:]]+${version}$" <(echo "$installed_packages") ||
+        return 1
+    done < "$1"
+}
+
+split() {
+    string="$1"
+    delimiter="$2"
+    s="$string$delimiter"
+    array=()
+    while [[ $s ]]; do
+        array+=( "${s%%"$delimiter"*}" );
+        s=${s#*"$delimiter"};
+    done
+    echo "${array[@]}"
+}
+
+promptUser() {
+    while true; do
+        local proceed
+        read -p "$1" proceed
+        case "$proceed" in
+            y|yes) return 0;;
+            n|no) return 1;;
+            *) continue;;
+        esac
+    done
+}
+
+enter_directory() {
+    while true; do
+        local directory
+        read -p "$1" directory
+        [[ -d "$directory" ]] && break
+        echo "directory does not exist" >&2
+        continue
+    done
+    echo "$directory"
+}
+
+gen_syslog_ng_config_template() {
+cat << EOF
+#SOURCE
+source s_${PROJECT_NAME} {
+    network(
+        ip("$DATA_LISTENER_HOST")
+        port($DATA_LISTENER_PORT)
+        transport("$DATA_LISTENER_PROTO")
+    );
+};
+
+#DESTINATIONS
+destination d_${PROJECT_NAME} {
+    file(
+        "${DATA_LISTENER_LOG_DIR}/${PROJECT_NAME}-\${YEAR\}\${MONTH\}\${DAY}.log"
+        template("\$(format-json --scope nv-pairs --exclude MESSAGE --exclude LEGACY_MSGHDR)\n")
+    );
+};
+
+#LOG PATHS
+log {source(s_${PROJECT_NAME}); parser{json-parser();}; destination(d_${PROJECT_NAME});};
+EOF
+}
+
+
+################## MAIN SCRIPT ##################
+echo "Running setup for ${PROJECT_NAME}.."
+main ||
+{
+    echo ''
+    echo "Setup aborted for ${PROJECT_NAME}"
+    exit 1
+}
+echo ''
+echo "Setup complete for ${PROJECT_NAME}!"
+echo ''
+echo "For initial launch, run <sudo supervisorctl add ${PROJECT_NAME}>!"
+echo "To check status, run <sudo supervisorctl status ${PROJECT_NAME}>!"
+echo ''
+echo "View commands: https://github.com/quadrantsec/${PROJECT_NAME}#commands"
+echo "View log locations: https://github.com/quadrantsec/${PROJECT_NAME}#logs"
